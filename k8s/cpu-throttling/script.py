@@ -327,8 +327,6 @@ def main():
                        help=f'Time to wait between measurements in seconds (overrides {ENV_WAIT_SECONDS} env var)')
 
     # Output options
-    parser.add_argument('--json', action='store_true',
-                       help='Output results in JSON format')
     parser.add_argument('--verbose', '-v', action='store_true',
                        help='Enable verbose output')
 
@@ -350,29 +348,48 @@ def main():
         verbose=args.verbose
     )
 
-    if args.json:
-        print(json.dumps(result, indent=2))
+    # Always output JSON with all values
+    if "error" in result:
+        error_result = {
+            "error": result["error"],
+            "status": "error",
+            "timestamp": time.time()
+        }
+        print(json.dumps(error_result, indent=2))
+        sys.exit(1)
     else:
-        if "error" in result:
-            print(f"Error: {result['error']}")
-        else:
-            print(f"\nResults:")
-            print(f"Average CPU Throttling: {result['average_throttling']:.2f}%")
-            print(f"Measurement Type: {result['measurement_type']}")
-            print(f"Valid Containers: {result['valid_container_count']}")
-            print("\nPer-Pod Results:")
-            for pod_result in result['pod_results']:
-                print(f"  Pod: {pod_result['pod_name']}")
-                print(f"    Throttling: {pod_result['throttling_percentage']:.2f}%")
-                print(f"    Throttled Rate: {pod_result['throttled_rate']:.2f}")
-                print(f"    Periods: {pod_result['nr_periods']}")
-                print(f"    Throttled: {pod_result['nr_throttled']}")
-                print(f"    Throttled Time: {pod_result['throttled_time_ns']} ns")
-                print(f"    Cgroup Path: {pod_result['cgroup_path']}")
-                if "periods_delta" in pod_result:
-                    print(f"    Periods Delta: {pod_result['periods_delta']}")
-                    print(f"    Throttled Delta: {pod_result['throttled_delta']}")
-                    print(f"    Throttled Time Delta: {pod_result['throttled_time_delta_ns']} ns")
+        output = {
+            "status": "success",
+            "timestamp": time.time(),
+            "average_throttling_percentage": result["average_throttling"],
+            "measurement_type": result["measurement_type"],
+            "container_name": result["container_name"],
+            "valid_container_count": result["valid_container_count"],
+            "pods": []
+        }
+        
+        for pod in result["pod_results"]:
+            pod_data = {
+                "name": pod["pod_name"],
+                "throttling_percentage": pod["throttling_percentage"],
+                "throttled_rate": pod["throttled_rate"],
+                "periods": pod["nr_periods"],
+                "throttled_count": pod["nr_throttled"],
+                "throttled_time_ns": pod["throttled_time_ns"],
+                "cgroup_path": pod["cgroup_path"]
+            }
+            
+            # Add differential measurement data if available
+            if "periods_delta" in pod:
+                pod_data.update({
+                    "periods_delta": pod["periods_delta"],
+                    "throttled_delta": pod["throttled_delta"],
+                    "throttled_time_delta_ns": pod["throttled_time_delta_ns"]
+                })
+                
+            output["pods"].append(pod_data)
+        
+        print(json.dumps(output, indent=2))
 
 if __name__ == "__main__":
     main()
