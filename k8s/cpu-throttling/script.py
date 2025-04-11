@@ -122,7 +122,7 @@ def get_cpu_stats(v1: client.CoreV1Api,
         stats = {
             'nr_periods': 0,
             'nr_throttled': 0,
-            'throttled_time': 0
+            # 'throttled_time': 0
         }
 
         for line in output.splitlines():
@@ -137,13 +137,13 @@ def get_cpu_stats(v1: client.CoreV1Api,
                     stats['nr_periods'] = int(value)
                 elif key == 'nr_throttled':
                     stats['nr_throttled'] = int(value)
-                elif key == 'throttled_time':
-                    stats['throttled_time'] = int(value)
+                # elif key == 'throttled_time':
+                #     stats['throttled_time'] = int(value)
 
         debug_print(f"\nProcessed CPU stats for pod {pod_name}:", verbose)
         debug_print(f"  Nr Periods: {stats['nr_periods']}", verbose)
         debug_print(f"  Nr Throttled: {stats['nr_throttled']}", verbose)
-        debug_print(f"  Throttled Time: {stats['throttled_time']} ns", verbose)
+        # debug_print(f"  Throttled Time: {stats['throttled_time']} ns", verbose)
         debug_print(f"  Cgroup Path: {stats.get('cgroup_path_used', 'unknown')}", verbose)
 
         if stats['nr_periods'] == 0:
@@ -236,11 +236,11 @@ def get_throttling_percentage(namespace: Optional[str] = None,
                 # Calculate throttling based on the difference
                 periods_delta = final_stats['nr_periods'] - initial_stats['nr_periods']
                 throttled_delta = final_stats['nr_throttled'] - initial_stats['nr_throttled']
-                throttled_time_delta = final_stats['throttled_time'] - initial_stats['throttled_time']
+                # throttled_time_delta = final_stats['throttled_time'] - initial_stats['throttled_time']
 
                 if periods_delta > 0:
                     throttling_percentage = (throttled_delta / periods_delta) * 100
-                    throttled_rate = throttled_time_delta / (periods_delta * 100_000_000)  # 100ms per period
+                    # throttled_rate = throttled_time_delta / (periods_delta * 100_000_000)  # 100ms per period
                 else:
                     debug_print(f"Warning: No new CPU periods for pod '{pod.metadata.name}'. Skipping.", verbose)
                     continue
@@ -250,7 +250,7 @@ def get_throttling_percentage(namespace: Optional[str] = None,
                 # Calculate throttling from single measurement
                 if initial_stats['nr_periods'] > 0:
                     throttling_percentage = (initial_stats['nr_throttled'] / initial_stats['nr_periods']) * 100
-                    throttled_rate = initial_stats['throttled_time'] / (initial_stats['nr_periods'] * 100_000_000)
+                    # throttled_rate = initial_stats['throttled_time'] / (initial_stats['nr_periods'] * 100_000_000)
                 else:
                     debug_print(f"Warning: No CPU periods recorded for pod '{pod.metadata.name}'. Skipping.", verbose)
                     continue
@@ -266,7 +266,7 @@ def get_throttling_percentage(namespace: Optional[str] = None,
                 "throttled_rate": throttled_rate,
                 "nr_periods": stats_to_use['nr_periods'],
                 "nr_throttled": stats_to_use['nr_throttled'],
-                "throttled_time_ns": stats_to_use['throttled_time'],
+                # "throttled_time_ns": stats_to_use['throttled_time'],
                 "cgroup_path": stats_to_use.get('cgroup_path_used', 'unknown')
             }
 
@@ -274,7 +274,7 @@ def get_throttling_percentage(namespace: Optional[str] = None,
                 pod_result.update({
                     "periods_delta": periods_delta,
                     "throttled_delta": throttled_delta,
-                    "throttled_time_delta_ns": throttled_time_delta
+                    # "throttled_time_delta_ns": throttled_time_delta
                 })
 
             pod_results.append(pod_result)
@@ -375,7 +375,7 @@ def main():
                 "throttled_rate": pod["throttled_rate"],
                 "periods": pod["nr_periods"],
                 "throttled_count": pod["nr_throttled"],
-                "throttled_time_ns": pod["throttled_time_ns"],
+                # "throttled_time_ns": pod["throttled_time_ns"],
                 "cgroup_path": pod["cgroup_path"]
             }
             
@@ -384,7 +384,7 @@ def main():
                 pod_data.update({
                     "periods_delta": pod["periods_delta"],
                     "throttled_delta": pod["throttled_delta"],
-                    "throttled_time_delta_ns": pod["throttled_time_delta_ns"]
+                    # "throttled_time_delta_ns": pod["throttled_time_delta_ns"]
                 })
                 
             output["pods"].append(pod_data)
