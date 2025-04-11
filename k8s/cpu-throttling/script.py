@@ -147,8 +147,9 @@ def get_cpu_stats(v1: client.CoreV1Api,
         debug_print(f"  Cgroup Path: {stats.get('cgroup_path_used', 'unknown')}", verbose)
 
         if stats['nr_periods'] == 0:
-            debug_print("Warning: No CPU periods recorded", verbose)
-            return None
+            debug_print(f"Warning: No CPU periods recorded for pod {pod_name}", verbose)
+            stats['nr_throttled'] = 0  # Ensure throttled count is 0 when no periods
+            return stats
 
         return stats
 
@@ -159,6 +160,13 @@ def get_cpu_stats(v1: client.CoreV1Api,
             debug_print(traceback.format_exc(), verbose)
         return None
 
+def get_container_cpu_stats(pod_name: str, container_name: str, namespace: str,
+                            cgroup_base_path: Optional[str] = None,
+                            complete_cgroup_path: Optional[str] = None,
+                            verbose: bool = False) -> Optional[Dict]:
+    v1 = get_kubernetes_client(verbose=verbose)
+    return get_cpu_stats(v1, namespace, pod_name, container_name, cgroup_base_path, complete_cgroup_path, verbose)
+
 def get_throttling_percentage(namespace: Optional[str] = None,
                             container_name: Optional[str] = None,
                             label_selector: Optional[str] = None,
@@ -167,139 +175,109 @@ def get_throttling_percentage(namespace: Optional[str] = None,
                             complete_cgroup_path: Optional[str] = None,
                             wait_seconds: Optional[float] = None,
                             verbose: bool = False) -> Dict:
-    """Calculate CPU throttling percentage for specified containers"""
     try:
-        # Get values from parameters or environment variables
-        namespace = namespace or os.getenv(ENV_NAMESPACE)
-        container_name = container_name or os.getenv(ENV_CONTAINER_NAME)
-        label_selector = label_selector or os.getenv(ENV_LABEL_SELECTOR)
-        kubeconfig_path = kubeconfig_path or os.getenv(ENV_KUBECONFIG)
-        
-        # Handle cgroup paths with proper precedence
-        if cgroup_base_path is None and complete_cgroup_path is None:
-            cgroup_base_path = os.getenv(ENV_CGROUP_PATH)
-            complete_cgroup_path = os.getenv(ENV_COMPLETE_CGROUP_PATH)
-        
-        # Handle wait_seconds from env var
-        if wait_seconds is None and os.getenv(ENV_WAIT_SECONDS):
-            try:
-                wait_seconds = float(os.getenv(ENV_WAIT_SECONDS))
-            except (TypeError, ValueError):
-                debug_print(f"Warning: Invalid {ENV_WAIT_SECONDS} value. Must be a number.", verbose)
-        
-        debug_print("\nConfiguration:", verbose)
-        debug_print(f"Namespace: {namespace}", verbose)
-        debug_print(f"Container Name: {container_name}", verbose)
-        debug_print(f"Label Selector: {label_selector}", verbose)
-        debug_print(f"Kubeconfig Path: {kubeconfig_path}", verbose)
-        debug_print(f"Cgroup Base Path: {cgroup_base_path}", verbose)
-        debug_print(f"Complete Cgroup Path: {complete_cgroup_path}", verbose)
-        debug_print(f"Wait Seconds: {wait_seconds}", verbose)
-        
-        if not namespace or not container_name or not label_selector:
-            raise ValueError("Missing required parameters: namespace, container_name, and label_selector must be provided")
+        config.load_kube_config(kubeconfig_path) if kubeconfig_path else config.load_kube_config()
+        debug_print("\nUsing default Kubernetes configuration from: ~/.kube/config", verbose)
+    except Exception as e:
+        return {
+            "status": "error",
+            "timestamp": time.time(),
+            "error": f"Failed to load Kubernetes configuration: {str(e)}"
+        }
 
-        # Initialize Kubernetes client
-        v1 = get_kubernetes_client(kubeconfig_path, verbose)
-
-        # Get pods matching the label selector
-        pods = v1.list_namespaced_pod(namespace=namespace, label_selector=label_selector).items
-        
+    v1 = client.CoreV1Api()
+    
+    try:
+        pods = v1.list_namespaced_pod(namespace, label_selector=label_selector).items
         debug_print(f"\nFound {len(pods)} pods matching label selector", verbose)
         
         if not pods:
-            raise ValueError(f"No pods found with label selector '{label_selector}' in namespace '{namespace}'.")
+            return {
+                "status": "success",
+                "timestamp": time.time(),
+                "message": "No pods found matching the criteria",
+                "pods": []
+            }
 
         total_throttling_percentage = 0
-        valid_container_count = 0
         pod_results = []
 
         for pod in pods:
-            debug_print(f"\nProcessing pod: {pod.metadata.name}", verbose)
+            initial_stats = get_container_cpu_stats(pod.metadata.name, container_name, namespace,
+                                                  cgroup_base_path, complete_cgroup_path, verbose)
             
-            # Get initial measurement
-            debug_print(f"Taking initial measurement...", verbose)
-            initial_stats = get_cpu_stats(v1, namespace, pod.metadata.name, container_name,
-                                        cgroup_base_path, complete_cgroup_path, verbose)
-            if initial_stats is None:
-                continue
-
-            # If wait_seconds is specified, take a second measurement
             if wait_seconds:
                 debug_print(f"\nWaiting {wait_seconds} seconds for second measurement...", verbose)
                 time.sleep(wait_seconds)
-                final_stats = get_cpu_stats(v1, namespace, pod.metadata.name, container_name,
-                                          cgroup_base_path, complete_cgroup_path, verbose)
-                if final_stats is None:
-                    continue
+                final_stats = get_container_cpu_stats(pod.metadata.name, container_name, namespace,
+                                                    cgroup_base_path, complete_cgroup_path, verbose)
+            else:
+                final_stats = initial_stats
 
-                # Calculate throttling based on the difference
+            if initial_stats is None:
+                debug_print(f"Warning: Could not get CPU stats for pod '{pod.metadata.name}'. Setting throttling to 0%.", verbose)
+                pod_result = {
+                    "pod_name": pod.metadata.name,
+                    "throttling_percentage": 0,
+                    "throttled_rate": 0,
+                    "nr_periods": 0,
+                    "nr_throttled": 0,
+                    "cgroup_path": "unknown"
+                }
+                pod_results.append(pod_result)
+                continue
+
+            if wait_seconds and final_stats:
                 periods_delta = final_stats['nr_periods'] - initial_stats['nr_periods']
                 throttled_delta = final_stats['nr_throttled'] - initial_stats['nr_throttled']
-                # throttled_time_delta = final_stats['throttled_time'] - initial_stats['throttled_time']
 
                 if periods_delta > 0:
                     throttling_percentage = (throttled_delta / periods_delta) * 100
-                    # throttled_rate = throttled_time_delta / (periods_delta * 100_000_000)  # 100ms per period
                 else:
-                    debug_print(f"Warning: No new CPU periods for pod '{pod.metadata.name}'. Skipping.", verbose)
-                    continue
-
-                stats_to_use = final_stats  # Use final stats for raw numbers
+                    debug_print(f"No new CPU periods for pod '{pod.metadata.name}'. Setting throttling to 0%.", verbose)
+                    throttling_percentage = 0
+                stats_to_use = final_stats
             else:
-                # Calculate throttling from single measurement
                 if initial_stats['nr_periods'] > 0:
                     throttling_percentage = (initial_stats['nr_throttled'] / initial_stats['nr_periods']) * 100
-                    # throttled_rate = initial_stats['throttled_time'] / (initial_stats['nr_periods'] * 100_000_000)
                 else:
-                    debug_print(f"Warning: No CPU periods recorded for pod '{pod.metadata.name}'. Skipping.", verbose)
-                    continue
+                    debug_print(f"No CPU periods recorded for pod '{pod.metadata.name}'. Setting throttling to 0%.", verbose)
+                    throttling_percentage = 0
+                stats_to_use = initial_stats
 
-                stats_to_use = initial_stats  # Use initial stats for raw numbers
-
-            total_throttling_percentage += throttling_percentage
-            valid_container_count += 1
-            
             pod_result = {
                 "pod_name": pod.metadata.name,
                 "throttling_percentage": throttling_percentage,
-                "throttled_rate": throttled_rate,
+                "throttled_rate": throttling_percentage,
                 "nr_periods": stats_to_use['nr_periods'],
                 "nr_throttled": stats_to_use['nr_throttled'],
-                # "throttled_time_ns": stats_to_use['throttled_time'],
                 "cgroup_path": stats_to_use.get('cgroup_path_used', 'unknown')
             }
 
-            if wait_seconds:
+            if wait_seconds and final_stats:
                 pod_result.update({
                     "periods_delta": periods_delta,
-                    "throttled_delta": throttled_delta,
-                    # "throttled_time_delta_ns": throttled_time_delta
+                    "throttled_delta": throttled_delta
                 })
 
             pod_results.append(pod_result)
             debug_print(f"\nPod '{pod.metadata.name}':", verbose)
             debug_print(f"  CPU Throttling: {throttling_percentage:.2f}%", verbose)
-            debug_print(f"  Throttled Rate: {throttled_rate:.2f}", verbose)
+            debug_print(f"  Throttled Rate: {throttling_percentage:.2f}", verbose)
 
-        if valid_container_count == 0:
-            return {
-                "error": "No valid containers found for calculating throttling percentage.",
-                "pod_results": pod_results
-            }
-
-        average_throttling = total_throttling_percentage / valid_container_count
-        
         return {
-            "average_throttling": average_throttling,
-            "measurement_type": "differential" if wait_seconds else "instantaneous",
-            "container_name": container_name,
-            "pod_results": pod_results,
-            "valid_container_count": valid_container_count
+            "status": "success",
+            "timestamp": time.time(),
+            "message": "CPU throttling analysis completed",
+            "pods": pod_results
         }
 
     except Exception as e:
-        return {"error": str(e)}
+        return {
+            "status": "error",
+            "timestamp": time.time(),
+            "error": f"Failed to analyze CPU throttling: {str(e)}"
+        }
 
 def main():
     parser = argparse.ArgumentParser(description='Calculate CPU throttling percentage for Kubernetes containers')
@@ -361,34 +339,9 @@ def main():
         output = {
             "status": "success",
             "timestamp": time.time(),
-            "average_throttling_percentage": result["average_throttling"],
-            "measurement_type": result["measurement_type"],
-            "container_name": result["container_name"],
-            "valid_container_count": result["valid_container_count"],
-            "pods": []
+            "message": "CPU throttling analysis completed",
+            "pods": result["pods"]
         }
-        
-        for pod in result["pod_results"]:
-            pod_data = {
-                "name": pod["pod_name"],
-                "throttling_percentage": pod["throttling_percentage"],
-                "throttled_rate": pod["throttled_rate"],
-                "periods": pod["nr_periods"],
-                "throttled_count": pod["nr_throttled"],
-                # "throttled_time_ns": pod["throttled_time_ns"],
-                "cgroup_path": pod["cgroup_path"]
-            }
-            
-            # Add differential measurement data if available
-            if "periods_delta" in pod:
-                pod_data.update({
-                    "periods_delta": pod["periods_delta"],
-                    "throttled_delta": pod["throttled_delta"],
-                    # "throttled_time_delta_ns": pod["throttled_time_delta_ns"]
-                })
-                
-            output["pods"].append(pod_data)
-        
         print(json.dumps(output, indent=2))
 
 if __name__ == "__main__":
