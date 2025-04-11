@@ -35,8 +35,6 @@ data:
   NAMESPACE: "boutique"
   CONTAINER_NAME: "server"
   LABEL_SELECTOR: "app=cartservice"
-  WAIT_SECONDS: "0"
-  COMPLETE_CGROUP_PATH: "/sys/fs/cgroup/cpu/cpu.stat"
 ---
 apiVersion: v1
 kind: Pod
@@ -47,9 +45,9 @@ spec:
   serviceAccountName: cpu-throttle-monitor
   containers:
   - name: monitor
-    image: sagarnewdocker/cpu:latest
+    image: sagarnewdocker/cpu-throttle:0.3
     imagePullPolicy: Always
-    args: ["--verbose", "--json"]
+    args: ["--verbose"]
     envFrom:
     - configMapRef:
         name: cpu-throttle-config

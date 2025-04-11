@@ -6,6 +6,7 @@ import time
 import argparse
 import json
 from typing import Dict, List, Optional, Union
+import traceback
 
 try:
     from kubernetes import client, config, stream
@@ -31,47 +32,85 @@ def debug_print(message: str, verbose: bool = True) -> None:
     if verbose:
         print(message)
 
-def get_kubernetes_client(kubeconfig_path: Optional[str] = None, verbose: bool = False):
-    """Initialize and return Kubernetes client with proper configuration"""
+def get_kubernetes_client(verbose: bool = False):
+    """Get Kubernetes client using either in-cluster config or kubeconfig"""
     try:
-        if kubeconfig_path:
-            config.load_kube_config(kubeconfig_path)
-            debug_print(f"Using Kubernetes configuration from: {kubeconfig_path}", verbose)
-        else:
-            try:
-                # Try loading in-cluster config first
-                config.load_incluster_config()
-                debug_print("Using in-cluster Kubernetes configuration", verbose)
-            except config.ConfigException:
-                # Fall back to default kubeconfig
-                config.load_kube_config()
-                debug_print(f"Using default Kubernetes configuration from: {os.getenv('KUBECONFIG', '~/.kube/config')}", verbose)
-    except Exception as e:
-        raise Exception(f"Failed to load Kubernetes configuration: {str(e)}")
-    
-    return client.CoreV1Api()
+        # Try in-cluster configuration first
+        config.load_incluster_config()
+        debug_print("\nUsing in-cluster configuration", verbose)
+        return client.CoreV1Api()
+    except config.ConfigException:
+        try:
+            # Fall back to kubeconfig
+            config.load_kube_config()
+            debug_print("\nUsing default Kubernetes configuration from: ~/.kube/config", verbose)
+            return client.CoreV1Api()
+        except Exception as e:
+            raise Exception(f"Failed to load Kubernetes configuration: {str(e)}")
 
-def exec_in_container(v1: client.CoreV1Api, 
-                     namespace: str, 
-                     pod_name: str, 
-                     container_name: str, 
-                     command: List[str],
-                     verbose: bool = False) -> Optional[str]:
-    """Execute a command inside a container and return the output"""
+def exec_in_container(v1: client.CoreV1Api,
+                    namespace: str,
+                    pod_name: str,
+                    container_name: str,
+                    command: Union[str, List[str]],
+                    verbose: bool = False) -> Optional[str]:
+    """Execute a command in a container and return its output"""
     try:
-        resp = stream.stream(v1.connect_get_namespaced_pod_exec,
-                           pod_name,
-                           namespace,
-                           container=container_name,
-                           command=command,
-                           stderr=True,
-                           stdin=False,
-                           stdout=True,
-                           tty=False)
-        return resp
+        debug_print(f"Executing command in container: {command}", verbose)
+        
+        # Try to get pod info first to check if pod exists and is running
+        try:
+            pod = v1.read_namespaced_pod(pod_name, namespace)
+            if pod.status.phase != 'Running':
+                raise Exception(f"Pod {pod_name} is not running (current phase: {pod.status.phase})")
+            
+            # Check if container exists and is ready
+            container_found = False
+            container_ready = False
+            for container_status in pod.status.container_statuses:
+                if container_status.name == container_name:
+                    container_found = True
+                    container_ready = container_status.ready
+                    if not container_ready:
+                        raise Exception(f"Container {container_name} is not ready")
+                    break
+            
+            if not container_found:
+                raise Exception(f"Container {container_name} not found in pod {pod_name}")
+            
+        except client.ApiException as e:
+            if e.status == 404:
+                raise Exception(f"Pod {pod_name} not found in namespace {namespace}")
+            raise Exception(f"Failed to get pod info: {str(e)}")
+
+        # Now try to exec into the container
+        try:
+            resp = stream.stream(
+                v1.connect_get_namespaced_pod_exec,
+                pod_name,
+                namespace,
+                container=container_name,
+                command=command if isinstance(command, list) else ["/bin/sh", "-c", command],
+                stderr=True,
+                stdin=False,
+                stdout=True,
+                tty=False
+            )
+            return resp
+            
+        except client.ApiException as e:
+            if e.status == 403:
+                raise Exception(f"Permission denied to exec into container {container_name}")
+            elif e.status == 400:
+                raise Exception(f"Invalid container name or command: {str(e)}")
+            else:
+                raise Exception(f"Failed to exec into container: {str(e)}")
+            
     except Exception as e:
-        debug_print(f"Error executing command in container: {e}", verbose)
-        return None
+        debug_print(f"Error executing command in container: {str(e)}", verbose)
+        if verbose:
+            debug_print(traceback.format_exc(), verbose)
+        raise
 
 def get_cpu_stats(v1: client.CoreV1Api,
                   namespace: str,
@@ -80,85 +119,94 @@ def get_cpu_stats(v1: client.CoreV1Api,
                   cgroup_base_path: Optional[str] = None,
                   complete_cgroup_path: Optional[str] = None,
                   verbose: bool = False) -> Optional[Dict]:
-    """Get CPU stats from inside the container"""
+    """Get CPU throttling stats from a container's cgroup"""
     try:
-        # Construct the command based on provided paths
-        if complete_cgroup_path:
-            check_cmd = [
-                "sh", "-c",
-                f"if [ -f {complete_cgroup_path} ]; then "
-                f"echo \"Found: {complete_cgroup_path}\"; "
-                f"cat {complete_cgroup_path}; exit 0; "
-                f"else echo \"Path not found: {complete_cgroup_path}\"; exit 1; fi"
-            ]
-        elif cgroup_base_path:
-            check_cmd = [
-                "sh", "-c",
-                f"for p in {cgroup_base_path}/cpu.stat {cgroup_base_path}/cpu/cpu.stat; do "
-                "if [ -f $p ]; then echo \"Found: $p\"; cat $p; exit 0; fi; "
-                "done; echo 'No cpu.stat found in base path'; exit 1"
-            ]
-        else:
-            check_cmd = [
-                "sh", "-c",
-                "for p in /sys/fs/cgroup/cpu.stat /sys/fs/cgroup/cpu/cpu.stat; do "
-                "if [ -f $p ]; then echo \"Found: $p\"; cat $p; exit 0; fi; "
-                "done; echo 'No cpu.stat found'; exit 1"
-            ]
-        
-        debug_print(f"Executing command in container: {' '.join(check_cmd)}", verbose)
-        output = exec_in_container(v1, namespace, pod_name, container_name, check_cmd, verbose)
-        
-        if not output or "No cpu.stat found" in output or "Path not found" in output:
-            debug_print("No cpu.stat file found in container", verbose)
-            if verbose:
-                # List available files in cgroup directory
-                ls_cmd = ["sh", "-c", "ls -R /sys/fs/cgroup/"]
-                ls_output = exec_in_container(v1, namespace, pod_name, container_name, ls_cmd, verbose)
-                debug_print("Available files in /sys/fs/cgroup:", verbose)
-                debug_print(ls_output, verbose)
-            return None
+        # Command to find and read cpu.stat file
+        cmd = (
+            "sh -c 'if [ -f /sys/fs/cgroup/cpu.stat ]; then "
+            "echo \"Found: /sys/fs/cgroup/cpu.stat\"; "
+            "cat /sys/fs/cgroup/cpu.stat; "
+            "exit 0; "
+            "else echo \"No cpu.stat found\"; exit 1; fi'"
+        )
 
+        try:
+            output = exec_in_container(v1, namespace, pod_name, container_name, cmd, verbose)
+            if not output:
+                raise Exception("No output received from container")
+        except Exception as e:
+            raise Exception(f"Failed to execute in container: {str(e)}")
+
+        # First check if we got a "No cpu.stat found" message
+        if "No cpu.stat found" in output:
+            # Try to list available files to help with debugging
+            try:
+                ls_cmd = "sh -c 'ls -R /sys/fs/cgroup/'"
+                ls_output = exec_in_container(v1, namespace, pod_name, container_name, ls_cmd, verbose)
+                debug_print("\nAvailable files in /sys/fs/cgroup:", verbose)
+                debug_print(ls_output, verbose)
+            except Exception as ls_err:
+                debug_print(f"\nFailed to list cgroup files: {str(ls_err)}", verbose)
+            raise Exception(f"Could not find cpu.stat file in container {container_name} of pod {pod_name}")
+
+        # Parse the output to find the cgroup path
+        cgroup_path = None
+        for line in output.splitlines():
+            if line.startswith('Found:'):
+                cgroup_path = line.split(':', 1)[1].strip()
+                break
+
+        if not cgroup_path:
+            raise Exception(f"Could not determine cgroup path in container {container_name} of pod {pod_name}")
+
+        # Initialize stats dictionary
         stats = {
             'nr_periods': 0,
             'nr_throttled': 0,
-            # 'throttled_time': 0
+            'throttled_time': 0,
+            'cgroup_path_used': cgroup_path
         }
 
+        # Parse CPU stats
+        found_any_stat = False
         for line in output.splitlines():
-            if "Found:" in line:
-                stats['cgroup_path_used'] = line.split("Found:")[1].strip()
+            if ':' not in line and ' ' not in line:
                 continue
-            
-            parts = line.strip().split()
-            if len(parts) == 2:
-                key, value = parts
+
+            try:
+                if ' ' in line:
+                    key, value = map(str.strip, line.split(' ', 1))
+                else:
+                    key, value = map(str.strip, line.split(':', 1))
+
                 if key == 'nr_periods':
                     stats['nr_periods'] = int(value)
+                    found_any_stat = True
                 elif key == 'nr_throttled':
                     stats['nr_throttled'] = int(value)
-                # elif key == 'throttled_time':
-                #     stats['throttled_time'] = int(value)
+                    found_any_stat = True
+                elif key == 'throttled_usec':
+                    stats['throttled_time'] = int(value)
+                    found_any_stat = True
+            except ValueError as e:
+                raise Exception(f"Invalid value in cpu.stat file for {key}: {value}")
+
+        if not found_any_stat:
+            raise Exception(f"Could not read CPU stats from {cgroup_path} in container {container_name} of pod {pod_name}")
 
         debug_print(f"\nProcessed CPU stats for pod {pod_name}:", verbose)
         debug_print(f"  Nr Periods: {stats['nr_periods']}", verbose)
         debug_print(f"  Nr Throttled: {stats['nr_throttled']}", verbose)
-        # debug_print(f"  Throttled Time: {stats['throttled_time']} ns", verbose)
+        debug_print(f"  Throttled Time: {stats['throttled_time']} us", verbose)
         debug_print(f"  Cgroup Path: {stats.get('cgroup_path_used', 'unknown')}", verbose)
-
-        if stats['nr_periods'] == 0:
-            debug_print(f"Warning: No CPU periods recorded for pod {pod_name}", verbose)
-            stats['nr_throttled'] = 0  # Ensure throttled count is 0 when no periods
-            return stats
 
         return stats
 
     except Exception as e:
-        debug_print(f"Error reading CPU stats for pod '{pod_name}': {str(e)}", verbose)
+        debug_print(f"\nError getting CPU stats for pod {pod_name}: {str(e)}", verbose)
         if verbose:
-            import traceback
             debug_print(traceback.format_exc(), verbose)
-        return None
+        raise Exception(f"Failed to get CPU stats: {str(e)}")
 
 def get_container_cpu_stats(pod_name: str, container_name: str, namespace: str,
                             cgroup_base_path: Optional[str] = None,
@@ -176,19 +224,45 @@ def get_throttling_percentage(namespace: Optional[str] = None,
                             wait_seconds: Optional[float] = None,
                             verbose: bool = False) -> Dict:
     try:
-        config.load_kube_config(kubeconfig_path) if kubeconfig_path else config.load_kube_config()
-        debug_print("\nUsing default Kubernetes configuration from: ~/.kube/config", verbose)
-    except Exception as e:
-        return {
-            "status": "error",
-            "timestamp": time.time(),
-            "error": f"Failed to load Kubernetes configuration: {str(e)}"
-        }
+        # Get values from parameters or environment variables
+        namespace = namespace or os.getenv(ENV_NAMESPACE)
+        container_name = container_name or os.getenv(ENV_CONTAINER_NAME)
+        label_selector = label_selector or os.getenv(ENV_LABEL_SELECTOR)
+        
+        # Validate required parameters
+        if not namespace:
+            return {
+                "status": "error",
+                "timestamp": time.time(),
+                "error": "Namespace is required. Provide it via --namespace flag or NAMESPACE environment variable."
+            }
+            
+        if not container_name:
+            return {
+                "status": "error",
+                "timestamp": time.time(),
+                "error": "Container name is required. Provide it via --container-name flag or CONTAINER_NAME environment variable."
+            }
+            
+        if not label_selector:
+            return {
+                "status": "error",
+                "timestamp": time.time(),
+                "error": "Label selector is required. Provide it via --label-selector flag or LABEL_SELECTOR environment variable."
+            }
 
-    v1 = client.CoreV1Api()
-    
-    try:
-        pods = v1.list_namespaced_pod(namespace, label_selector=label_selector).items
+        debug_print("\nConfiguration:", verbose)
+        debug_print(f"Namespace: {namespace}", verbose)
+        debug_print(f"Container Name: {container_name}", verbose)
+        debug_print(f"Label Selector: {label_selector}", verbose)
+        debug_print(f"Kubeconfig Path: {kubeconfig_path}", verbose)
+        debug_print(f"Cgroup Base Path: {cgroup_base_path}", verbose)
+        debug_print(f"Complete Cgroup Path: {complete_cgroup_path}", verbose)
+        debug_print(f"Wait Seconds: {wait_seconds}", verbose)
+
+        v1 = get_kubernetes_client(verbose)
+        
+        pods = v1.list_namespaced_pod(namespace=namespace, label_selector=label_selector).items
         debug_print(f"\nFound {len(pods)} pods matching label selector", verbose)
         
         if not pods:
@@ -199,71 +273,65 @@ def get_throttling_percentage(namespace: Optional[str] = None,
                 "pods": []
             }
 
-        total_throttling_percentage = 0
         pod_results = []
 
         for pod in pods:
-            initial_stats = get_container_cpu_stats(pod.metadata.name, container_name, namespace,
-                                                  cgroup_base_path, complete_cgroup_path, verbose)
-            
-            if wait_seconds:
-                debug_print(f"\nWaiting {wait_seconds} seconds for second measurement...", verbose)
-                time.sleep(wait_seconds)
-                final_stats = get_container_cpu_stats(pod.metadata.name, container_name, namespace,
-                                                    cgroup_base_path, complete_cgroup_path, verbose)
-            else:
-                final_stats = initial_stats
+            try:
+                initial_stats = get_container_cpu_stats(pod.metadata.name, container_name, namespace,
+                                                      cgroup_base_path, complete_cgroup_path, verbose)
+                
+                if wait_seconds:
+                    debug_print(f"\nWaiting {wait_seconds} seconds for second measurement...", verbose)
+                    time.sleep(wait_seconds)
+                    final_stats = get_container_cpu_stats(pod.metadata.name, container_name, namespace,
+                                                        cgroup_base_path, complete_cgroup_path, verbose)
+                else:
+                    final_stats = initial_stats
 
-            if initial_stats is None:
-                debug_print(f"Warning: Could not get CPU stats for pod '{pod.metadata.name}'. Setting throttling to 0%.", verbose)
+                if wait_seconds and final_stats:
+                    periods_delta = final_stats['nr_periods'] - initial_stats['nr_periods']
+                    throttled_delta = final_stats['nr_throttled'] - initial_stats['nr_throttled']
+
+                    if periods_delta > 0:
+                        throttling_percentage = (throttled_delta / periods_delta) * 100
+                    else:
+                        debug_print(f"No new CPU periods for pod '{pod.metadata.name}'. Setting throttling to 0%.", verbose)
+                        throttling_percentage = 0
+                    stats_to_use = final_stats
+                else:
+                    if initial_stats['nr_periods'] > 0:
+                        throttling_percentage = (initial_stats['nr_throttled'] / initial_stats['nr_periods']) * 100
+                    else:
+                        debug_print(f"No CPU periods recorded for pod '{pod.metadata.name}'. Setting throttling to 0%.", verbose)
+                        throttling_percentage = 0
+                    stats_to_use = initial_stats
+
                 pod_result = {
                     "pod_name": pod.metadata.name,
-                    "throttling_percentage": 0,
-                    "throttled_rate": 0,
-                    "nr_periods": 0,
-                    "nr_throttled": 0,
-                    "cgroup_path": "unknown"
+                    "throttling_percentage": throttling_percentage,
+                    "throttled_rate": throttling_percentage,
+                    "nr_periods": stats_to_use['nr_periods'],
+                    "nr_throttled": stats_to_use['nr_throttled'],
+                    "cgroup_path": stats_to_use.get('cgroup_path_used', 'unknown')
                 }
+
+                if wait_seconds and final_stats:
+                    pod_result.update({
+                        "periods_delta": periods_delta,
+                        "throttled_delta": throttled_delta
+                    })
+
                 pod_results.append(pod_result)
-                continue
+                debug_print(f"\nPod '{pod.metadata.name}':", verbose)
+                debug_print(f"  CPU Throttling: {throttling_percentage:.2f}%", verbose)
+                debug_print(f"  Throttled Rate: {throttling_percentage:.2f}", verbose)
 
-            if wait_seconds and final_stats:
-                periods_delta = final_stats['nr_periods'] - initial_stats['nr_periods']
-                throttled_delta = final_stats['nr_throttled'] - initial_stats['nr_throttled']
-
-                if periods_delta > 0:
-                    throttling_percentage = (throttled_delta / periods_delta) * 100
-                else:
-                    debug_print(f"No new CPU periods for pod '{pod.metadata.name}'. Setting throttling to 0%.", verbose)
-                    throttling_percentage = 0
-                stats_to_use = final_stats
-            else:
-                if initial_stats['nr_periods'] > 0:
-                    throttling_percentage = (initial_stats['nr_throttled'] / initial_stats['nr_periods']) * 100
-                else:
-                    debug_print(f"No CPU periods recorded for pod '{pod.metadata.name}'. Setting throttling to 0%.", verbose)
-                    throttling_percentage = 0
-                stats_to_use = initial_stats
-
-            pod_result = {
-                "pod_name": pod.metadata.name,
-                "throttling_percentage": throttling_percentage,
-                "throttled_rate": throttling_percentage,
-                "nr_periods": stats_to_use['nr_periods'],
-                "nr_throttled": stats_to_use['nr_throttled'],
-                "cgroup_path": stats_to_use.get('cgroup_path_used', 'unknown')
-            }
-
-            if wait_seconds and final_stats:
-                pod_result.update({
-                    "periods_delta": periods_delta,
-                    "throttled_delta": throttled_delta
-                })
-
-            pod_results.append(pod_result)
-            debug_print(f"\nPod '{pod.metadata.name}':", verbose)
-            debug_print(f"  CPU Throttling: {throttling_percentage:.2f}%", verbose)
-            debug_print(f"  Throttled Rate: {throttling_percentage:.2f}", verbose)
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "timestamp": time.time(),
+                    "error": f"Failed to get CPU stats for pod {pod.metadata.name}: {str(e)}"
+                }
 
         return {
             "status": "success",
