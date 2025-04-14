@@ -121,13 +121,25 @@ def get_cpu_stats(v1: client.CoreV1Api,
                   verbose: bool = False) -> Optional[Dict]:
     """Get CPU throttling stats from a container's cgroup"""
     try:
-        # Command to find and read cpu.stat file
+        # Command to find and read cpu.stat file with fallback paths
         cmd = (
-            "sh -c 'if [ -f /sys/fs/cgroup/cpu.stat ]; then "
+            "sh -c '"
+            "if [ -f /sys/fs/cgroup/cpu.stat ]; then "
             "echo \"Found: /sys/fs/cgroup/cpu.stat\"; "
             "cat /sys/fs/cgroup/cpu.stat; "
             "exit 0; "
-            "else echo \"No cpu.stat found\"; exit 1; fi'"
+            "elif [ -f /sys/fs/cgroup/cpu/cpu.stat ]; then "
+            "echo \"Found: /sys/fs/cgroup/cpu/cpu.stat\"; "
+            "cat /sys/fs/cgroup/cpu/cpu.stat; "
+            "exit 0; "
+            "elif [ -f /sys/fs/cgroup/cpuacct/cpu.stat ]; then "
+            "echo \"Found: /sys/fs/cgroup/cpuacct/cpu.stat\"; "
+            "cat /sys/fs/cgroup/cpuacct/cpu.stat; "
+            "exit 0; "
+            "else "
+            "echo \"No cpu.stat found in any of the standard locations\"; "
+            "exit 1; "
+            "fi'"
         )
 
         try:
@@ -141,13 +153,13 @@ def get_cpu_stats(v1: client.CoreV1Api,
         if "No cpu.stat found" in output:
             # Try to list available files to help with debugging
             try:
-                ls_cmd = "sh -c 'ls -R /sys/fs/cgroup/'"
+                ls_cmd = "sh -c 'echo \"=== /sys/fs/cgroup ===\" && ls -R /sys/fs/cgroup/ && echo \"=== /sys/fs/cgroup/cpu ===\" && ls -R /sys/fs/cgroup/cpu/ 2>/dev/null || true && echo \"=== /sys/fs/cgroup/cpuacct ===\" && ls -R /sys/fs/cgroup/cpuacct/ 2>/dev/null || true'"
                 ls_output = exec_in_container(v1, namespace, pod_name, container_name, ls_cmd, verbose)
-                debug_print("\nAvailable files in /sys/fs/cgroup:", verbose)
+                debug_print("\nAvailable files in cgroup directories:", verbose)
                 debug_print(ls_output, verbose)
             except Exception as ls_err:
                 debug_print(f"\nFailed to list cgroup files: {str(ls_err)}", verbose)
-            raise Exception(f"Could not find cpu.stat file in container {container_name} of pod {pod_name}")
+            raise Exception(f"Could not find cpu.stat file in any standard location in container {container_name} of pod {pod_name}")
 
         # Parse the output to find the cgroup path
         cgroup_path = None
