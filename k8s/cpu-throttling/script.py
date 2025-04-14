@@ -375,6 +375,8 @@ def main():
     # Output options
     parser.add_argument('--verbose', '-v', action='store_true',
                        help='Enable verbose output')
+    parser.add_argument('--json', action='store_true',
+                       help='Output detailed JSON instead of just the throttling percentage')
 
     args = parser.parse_args()
 
@@ -394,23 +396,36 @@ def main():
         verbose=args.verbose
     )
 
-    # Always output JSON with all values
-    if "error" in result:
-        error_result = {
-            "error": result["error"],
-            "status": "error",
-            "timestamp": time.time()
-        }
-        print(json.dumps(error_result, indent=2))
-        sys.exit(1)
+    # Handle output based on mode
+    if args.json:
+        if "error" in result:
+            error_result = {
+                "error": result["error"],
+                "status": "error",
+                "timestamp": time.time()
+            }
+            print(json.dumps(error_result, indent=2))
+            sys.exit(1)
+        else:
+            output = {
+                "status": "success",
+                "timestamp": time.time(),
+                "message": "CPU throttling analysis completed",
+                "pods": result["pods"]
+            }
+            print(json.dumps(output, indent=2))
     else:
-        output = {
-            "status": "success",
-            "timestamp": time.time(),
-            "message": "CPU throttling analysis completed",
-            "pods": result["pods"]
-        }
-        print(json.dumps(output, indent=2))
+        if "error" in result:
+            print(result["error"], file=sys.stderr)
+            sys.exit(1)
+        else:
+            # For float output, we'll use the average throttling percentage if multiple pods are found
+            if result["pods"]:
+                total_percentage = sum(pod["throttling_percentage"] for pod in result["pods"])
+                avg_percentage = total_percentage / len(result["pods"])
+                print(f"{avg_percentage:.6f}")
+            else:
+                print("0.000000")
 
 if __name__ == "__main__":
     main()
