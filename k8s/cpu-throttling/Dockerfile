@@ -1,16 +1,19 @@
-# Start from a base image with Python
-FROM --platform=linux/amd64 python:3.9-slim
+# Use Alpine-based Python image for a smaller footprint
+FROM --platform=linux/amd64 python:3.9-alpine
 
-# Install dependencies for Kubernetes API and kubectl
-RUN pip install kubernetes && \
-    apt-get update && \
-    apt-get install -y curl && \
-    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/arm64/kubectl" && \
-    install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+# Install required system packages
+RUN apk add --no-cache \
+    curl \
+    bash \
+    && rm -rf /var/cache/apk/*
 
-# Set environment variables for Kubernetes
-# ENV KUBECONFIG=/root/.kube/config
+# Install Python dependencies
+RUN pip install --no-cache-dir kubernetes
+
+# Install kubectl
+RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && \
+    chmod +x kubectl && \
+    mv kubectl /usr/local/bin/
 
 # Set Python to unbuffered mode for better logging
 ENV PYTHONUNBUFFERED=1
