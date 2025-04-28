@@ -33,8 +33,8 @@ metadata:
   namespace: default
 data:
   NAMESPACE: "boutique"
-  CONTAINER_NAME: "server"
-  LABEL_SELECTOR: "app=cartservice"
+  CONTAINER_NAME: "redis"
+  LABEL_SELECTOR: "app=redis-cart"
 ---
 apiVersion: v1
 kind: Pod
@@ -45,7 +45,7 @@ spec:
   serviceAccountName: cpu-throttle-monitor
   containers:
   - name: monitor
-    image: sagarnewdocker/cpu-throttle:0.3
+    image: sagarnewdocker/cpu-throttle:alpine-0.1
     imagePullPolicy: Always
     args: ["--verbose"]
     envFrom:
